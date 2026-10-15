@@ -147,7 +147,7 @@ export async function recordPoolSample(
         sampled_at, last_attempt_at, consecutive_failures,
         graduated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 0,
-        CASE WHEN $6 = 1 THEN $14 ELSE NULL END)
+        CASE WHEN $6::bigint = 1 THEN $14::bigint ELSE NULL END)
        ON CONFLICT (pool_address) DO UPDATE SET
          price = excluded.price,
          quote_reserve = excluded.quote_reserve,

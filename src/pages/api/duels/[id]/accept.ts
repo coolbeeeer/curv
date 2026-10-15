@@ -49,7 +49,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   const message = buildDuelActionMessage(duel.poolA, duel.poolB, 'accept', duel.id, timestamp);
-  const ok = await verifyWalletSignature(wallet, message, signature);
+  const ok = await verifyWalletSignature(message, signature, wallet);
   if (!ok) return res.status(401).json({ error: 'Invalid signature' });
 
   const isGraduated = async (poolAddress: string): Promise<boolean> => {
