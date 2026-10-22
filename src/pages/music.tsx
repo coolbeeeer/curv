@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import Head from 'next/head';
 import Page from '@/components/ui/Page/Page';
 
@@ -18,8 +18,6 @@ const LANGUAGES: { label: string; code: string }[] = [
 const DURATIONS = [60, 90, 120, 150];
 
 const LIBRARY_KEY = 'curv-music-library';
-const POLL_INTERVAL_MS = 5000;
-const POLL_TIMEOUT_MS = 10 * 60 * 1000;
 
 interface LibraryEntry {
   id: string;
@@ -61,14 +59,22 @@ export default function MusicStudioPage() {
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
   const [latest, setLatest] = useState<LibraryEntry | null>(null);
-  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [elapsedSec, setElapsedSec] = useState(0);
 
   useEffect(() => {
     setLibrary(loadLibrary());
-    return () => {
-      if (pollTimer.current) clearTimeout(pollTimer.current);
-    };
   }, []);
+
+  useEffect(() => {
+    if (!busy) return;
+    const startedAt = Date.now();
+    setElapsedSec(0);
+    const timer = setInterval(
+      () => setElapsedSec(Math.floor((Date.now() - startedAt) / 1000)),
+      1000
+    );
+    return () => clearInterval(timer);
+  }, [busy]);
 
   const saveLibrary = useCallback((entries: LibraryEntry[]) => {
     setLibrary(entries);
@@ -78,65 +84,6 @@ export default function MusicStudioPage() {
       // Storage full or unavailable; the in-memory list still works.
     }
   }, []);
-
-  const poll = useCallback(
-    (
-      eventId: string,
-      startedAt: number,
-      pendingTitle: string,
-      pendingDuration: number
-    ) => {
-      const tick = async () => {
-        if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
-          setBusy(false);
-          setStatus('');
-          setError(
-            'Generation is taking too long and was stopped. Please try again.'
-          );
-          return;
-        }
-        try {
-          const res = await fetch(
-            `/api/music/status?eventId=${encodeURIComponent(eventId)}`
-          );
-          const data = (await res.json()) as {
-            state?: string;
-            audioUrl?: string;
-            message?: string;
-          };
-          if (data.state === 'complete' && data.audioUrl) {
-            const entry: LibraryEntry = {
-              id: `${Date.now()}`,
-              title: pendingTitle,
-              createdAt: new Date().toISOString(),
-              durationSec: pendingDuration,
-              audioUrl: data.audioUrl,
-            };
-            setLatest(entry);
-            saveLibrary([entry, ...loadLibrary()]);
-            setBusy(false);
-            setStatus('');
-            return;
-          }
-          if (data.state === 'error') {
-            setBusy(false);
-            setStatus('');
-            setError(
-              data.message ??
-                'The music engine reported an error. Please try again.'
-            );
-            return;
-          }
-        } catch {
-          // A failed poll is not fatal; keep waiting for the next one.
-        }
-        setStatus('Generating your song. This can take a few minutes.');
-        pollTimer.current = setTimeout(tick, POLL_INTERVAL_MS);
-      };
-      void tick();
-    },
-    [saveLibrary]
-  );
 
   const onGenerate = async () => {
     setError('');
@@ -150,8 +97,10 @@ export default function MusicStudioPage() {
       return;
     }
     setBusy(true);
-    setStatus('Sending your song to the engine.');
+    setStatus('Generating your song. A full song can take a few minutes.');
     try {
+      // One long request: the server stays connected to the engine until
+      // the song is finished, so there is no polling from here.
       const res = await fetch('/api/music/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -167,27 +116,42 @@ export default function MusicStudioPage() {
           durationSec,
         }),
       });
-      const data = (await res.json()) as { eventId?: string; error?: string };
-      if (!res.ok || !data.eventId) {
-        setBusy(false);
-        setStatus('');
+      const data = (await res.json()) as {
+        state?: string;
+        audioUrl?: string;
+        message?: string;
+        error?: string;
+      };
+      setBusy(false);
+      setStatus('');
+      if (!res.ok) {
         setError(
           data.error ??
             'The music engine could not accept the job. Please try again.'
         );
         return;
       }
-      setStatus('Queued on the engine.');
-      poll(
-        data.eventId,
-        Date.now(),
-        title.trim() || 'Untitled song',
-        durationSec
+      if (data.state === 'complete' && data.audioUrl) {
+        const entry: LibraryEntry = {
+          id: `${Date.now()}`,
+          title: title.trim() || 'Untitled song',
+          createdAt: new Date().toISOString(),
+          durationSec,
+          audioUrl: data.audioUrl,
+        };
+        setLatest(entry);
+        saveLibrary([entry, ...loadLibrary()]);
+        return;
+      }
+      setError(
+        data.message ?? 'The music engine reported an error. Please try again.'
       );
     } catch {
       setBusy(false);
       setStatus('');
-      setError('Could not reach the studio server. Please try again.');
+      setError(
+        'The request was interrupted before the engine finished. Please try again.'
+      );
     }
   };
 
@@ -376,6 +340,10 @@ export default function MusicStudioPage() {
           {status && (
             <p className="mt-4 text-sm text-neutral-300" role="status">
               {status}
+              {busy &&
+                ` Elapsed: ${Math.floor(elapsedSec / 60)}:${String(
+                  elapsedSec % 60
+                ).padStart(2, '0')}.`}
             </p>
           )}
           {error && (

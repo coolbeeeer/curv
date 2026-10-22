@@ -1,8 +1,18 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { QUOTA_MESSAGE, submitGeneration } from '@/lib/music/aceStep';
+import {
+  awaitGeneration,
+  GENERIC_ERROR_MESSAGE,
+  submitGeneration,
+  toFriendlyError,
+} from '@/lib/music/aceStep';
+
+/** Allow the long engine wait on Vercel; the route awaits the full job. */
+export const maxDuration = 300;
 
 export interface GenerateResponse {
-  eventId?: string;
+  state?: 'complete' | 'error';
+  audioUrl?: string;
+  message?: string;
   error?: string;
 }
 
@@ -14,8 +24,11 @@ function badRequest(res: NextApiResponse<GenerateResponse>, message: string) {
 
 /**
  * POST /api/music/generate
- * Validates the studio form payload, composes the engine style prompt, and
- * submits a job to the ACE-Step engine. Returns { eventId } for polling.
+ * Validates the studio form payload, composes the engine style prompt,
+ * submits a job to the ACE-Step engine, and stays connected until the job
+ * finishes: the engine's event stream is single-consumption, so polling it
+ * would destroy the job. Responds 200 with { state: 'complete', audioUrl }
+ * or { state: 'error', message } once the terminal event arrives.
  */
 export default async function handler(
   req: NextApiRequest,
@@ -85,19 +98,25 @@ export default async function handler(
     .join(', ');
 
   try {
-    const eventId = await submitGeneration({
+    const job = await submitGeneration({
       style: composedStyle,
       lyrics: instrumental ? '' : lyrics,
       bpm,
       language,
       durationSec,
     });
-    return res.status(200).json({ eventId });
+    const result = await awaitGeneration(job, { timeoutMs: 270_000 });
+    if ('audioUrl' in result) {
+      return res
+        .status(200)
+        .json({ state: 'complete', audioUrl: result.audioUrl });
+    }
+    return res
+      .status(200)
+      .json({ state: 'error', message: toFriendlyError(result.error) });
   } catch (err) {
     const message =
-      err instanceof Error && err.message === QUOTA_MESSAGE
-        ? QUOTA_MESSAGE
-        : 'The music engine could not accept the job. Please try again in a moment.';
-    return res.status(502).json({ error: message });
+      err instanceof Error ? toFriendlyError(err.message) : GENERIC_ERROR_MESSAGE;
+    return res.status(200).json({ state: 'error', message });
   }
 }
