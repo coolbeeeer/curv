@@ -5,6 +5,10 @@
  * API. The engine is swappable: point ACESPACE_BASE_URL at any compatible
  * ACE-Step Space (for example one running on your own GPU machine) and
  * nothing else changes. No secrets are needed; the Space is public.
+ * Optionally set HF_TOKEN (HUGGINGFACE_TOKEN also works) to send an
+ * Authorization header with every engine request, so jobs run against
+ * that account's ZeroGPU quota instead of the anonymous pool. The token
+ * is never logged and never appears in any response.
  *
  * Flow: submitGeneration() POSTs to /gradio_api/queue/join and returns the
  * job handle. awaitGeneration() then opens the session's
@@ -37,6 +41,8 @@ export const TIMEOUT_MESSAGE =
   'The engine took too long to finish. Please try again.';
 export const GENERIC_ERROR_MESSAGE =
   'The music engine reported an error. Please try again.';
+export const TOKEN_REJECTED_MESSAGE =
+  'The Hugging Face token configured for the studio was rejected. Check the token and try again.';
 
 function baseUrl(): string {
   const fromEnv = process.env.ACESPACE_BASE_URL?.trim();
@@ -44,6 +50,25 @@ function baseUrl(): string {
     /\/+$/,
     ''
   );
+}
+
+function hfToken(): string {
+  return (process.env.HF_TOKEN ?? process.env.HUGGINGFACE_TOKEN ?? '').trim();
+}
+
+/**
+ * Authorization header for engine requests when a Hugging Face token is
+ * configured; an empty object when not, so unauthenticated requests stay
+ * exactly as before. The token value is only ever placed in this header.
+ */
+function authHeaders(): Record<string, string> {
+  const token = hfToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+/** True when a request carrying our token was refused with 401 or 403. */
+function isAuthFailure(status: number): boolean {
+  return hfToken().length > 0 && (status === 401 || status === 403);
 }
 
 export interface GenerationRequest {
@@ -83,8 +108,11 @@ interface EngineShape {
 let cachedShape: Promise<EngineShape> | null = null;
 
 async function fetchInfoParams(): Promise<GradioParameter[]> {
-  const res = await fetch(`${baseUrl()}/gradio_api/info`);
+  const res = await fetch(`${baseUrl()}/gradio_api/info`, {
+    headers: authHeaders(),
+  });
   if (!res.ok) {
+    if (isAuthFailure(res.status)) throw new Error(TOKEN_REJECTED_MESSAGE);
     throw new Error(`Engine info request failed with status ${res.status}.`);
   }
   const info = (await res.json()) as {
@@ -106,8 +134,9 @@ async function fetchInfoParams(): Promise<GradioParameter[]> {
  */
 async function loadShape(): Promise<EngineShape> {
   const params = await fetchInfoParams();
-  const res = await fetch(`${baseUrl()}/config`);
+  const res = await fetch(`${baseUrl()}/config`, { headers: authHeaders() });
   if (!res.ok) {
+    if (isAuthFailure(res.status)) throw new Error(TOKEN_REJECTED_MESSAGE);
     throw new Error(`Engine config request failed with status ${res.status}.`);
   }
   const config = (await res.json()) as {
@@ -168,6 +197,7 @@ function isQuotaText(text: string): boolean {
 
 /** Map a raw engine error string to the message shown to the user. */
 export function toFriendlyError(raw: string): string {
+  if (raw === TOKEN_REJECTED_MESSAGE) return TOKEN_REJECTED_MESSAGE;
   if (raw === 'timeout') return TIMEOUT_MESSAGE;
   if (isQuotaText(raw)) return QUOTA_MESSAGE;
   const lower = raw.toLowerCase();
@@ -203,11 +233,12 @@ async function submitWithModel(
 
   const res = await fetch(`${baseUrl()}/gradio_api/queue/join`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ data, fn_index: fnIndex, session_hash: sessionHash }),
   });
   const text = await res.text();
   if (!res.ok) {
+    if (isAuthFailure(res.status)) throw new Error(TOKEN_REJECTED_MESSAGE);
     if (isQuotaText(text)) throw new Error(QUOTA_MESSAGE);
     throw new Error(`Engine submit failed with status ${res.status}.`);
   }
@@ -234,7 +265,11 @@ export async function submitGeneration(
   try {
     return await submitWithModel(req, 'acestep-v15-xl-turbo');
   } catch (firstErr) {
-    if (firstErr instanceof Error && firstErr.message === QUOTA_MESSAGE)
+    if (
+      firstErr instanceof Error &&
+      (firstErr.message === QUOTA_MESSAGE ||
+        firstErr.message === TOKEN_REJECTED_MESSAGE)
+    )
       throw firstErr;
     return submitWithModel(req, 'acestep-v15-turbo');
   }
@@ -308,9 +343,10 @@ export async function awaitGeneration(
   try {
     const res = await fetch(
       `${baseUrl()}/gradio_api/queue/data?session_hash=${encodeURIComponent(job.sessionHash)}`,
-      { signal: controller.signal }
+      { signal: controller.signal, headers: authHeaders() }
     );
     if (!res.ok) {
+      if (isAuthFailure(res.status)) return { error: TOKEN_REJECTED_MESSAGE };
       const body = await res.text().catch(() => '');
       return { error: body.trim() || `HTTP ${res.status}` };
     }
